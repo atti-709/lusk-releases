@@ -1,0 +1,142 @@
+name: Release
+
+# Builds Lusk from the private source (atti-709/lusk, read-only deploy key) and publishes the
+# DMG, ZIP and update feed (latest-mac.yml) as a release of this public repo, which installed
+# apps read. Cut by hand: Actions > Release > Run workflow, or
+#   gh workflow run release.yml -R atti-709/lusk-releases -f bump=patch
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Version bump type"
+        required: true
+        default: patch
+        type: choice
+        options: [patch, minor, major]
+      version:
+        description: "Exact version instead of a bump (e.g. 1.0.69)"
+        required: false
+        default: ""
+      ref:
+        description: "Branch, tag or commit of atti-709/lusk to build"
+        required: true
+        default: main
+      publish:
+        description: "Publish the release (off = build and sign only, a dry run)"
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      - name: Check out the source
+        uses: actions/checkout@v5
+        with:
+          repository: atti-709/lusk
+          ref: ${{ github.event.inputs.ref }}
+          ssh-key: ${{ secrets.LUSK_DEPLOY_KEY }}
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+
+      - name: Compute the version
+        id: version
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            LATEST=$(gh release list -R "$GITHUB_REPOSITORY" --limit 200 --json tagName -q '.[].tagName' | grep '^v' | sed 's/^v//' | sort -V | tail -1)
+            [ -z "$LATEST" ] && { echo "No earlier release here: pass an exact version." >&2; exit 1; }
+            IFS='.' read -r MAJOR MINOR PATCH <<< "$LATEST"
+            case "${{ github.event.inputs.bump }}" in
+              major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
+              minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
+              patch) PATCH=$((PATCH + 1)) ;;
+            esac
+            VERSION="$MAJOR.$MINOR.$PATCH"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "Version $VERSION from atti-709/lusk@$(git rev-parse --short HEAD)"
+
+      - name: Set version in package.json
+        run: |
+          node -e "
+            const fs = require('fs');
+            const pkg = JSON.parse(fs.readFileSync('electron/package.json', 'utf8'));
+            pkg.version = '${{ steps.version.outputs.version }}';
+            fs.writeFileSync('electron/package.json', JSON.stringify(pkg, null, 2) + '\n');
+          "
+
+      - name: Install dependencies
+        run: npm install
+
+      # Same version as electron/package.json's devDependency, so a release builds with what was tested
+      - name: Install electron-builder globally
+        run: npm install -g electron-builder@$(node -p "require('./electron/node_modules/electron-builder/package.json').version" 2>/dev/null || node -p "require('./node_modules/electron-builder/package.json').version")
+
+      - name: Build all workspaces including Electron
+        run: npm run build:electron
+
+      - name: Bundle and build (unsigned)
+        working-directory: electron
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        run: npm run bundle && electron-builder --publish never
+
+      - name: Sign app with stable designated requirement
+        run: |
+          APP="electron/out/mac-arm64/Lusk.app"
+          # Sign from inside out (Electron requires this order)
+          find "$APP" -name "*.dylib" -exec codesign --force --sign - {} \;
+          find "$APP/Contents/Frameworks" -name "*.app" -exec codesign --force --sign - {} \;
+          find "$APP/Contents/Frameworks" -name "*.framework" -exec codesign --force --sign - {} \;
+          # The same designated requirement every release has had: Squirrel accepts an update
+          # only if it satisfies the running app's requirement
+          codesign --force --sign - \
+            --requirements '=designated => identifier "com.lusk.app"' \
+            "$APP"
+          codesign --verify --deep --strict "$APP" && echo "Signature OK"
+          # The packaged app must read its updates from this repo
+          grep -E "owner|repo" "$APP/Contents/Resources/app-update.yml"
+          grep -q "repo: lusk-releases" "$APP/Contents/Resources/app-update.yml"
+
+      # Pre-create the release so the DMG and ZIP publishers (which run concurrently) don't
+      # race to create it and drop assets
+      - name: Create the GitHub release
+        if: github.event.inputs.publish == 'true'
+        run: |
+          VERSION="v${{ steps.version.outputs.version }}"
+          if ! gh release view "$VERSION" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$VERSION" -R "$GITHUB_REPOSITORY" --title "$VERSION" \
+              --notes "Lusk ${{ steps.version.outputs.version }} for Apple Silicon Macs (macOS 13 or newer). Built from atti-709/lusk@${{ steps.version.outputs.sha }}."
+          fi
+
+      - name: Repackage and publish
+        if: github.event.inputs.publish == 'true'
+        working-directory: electron
+        run: |
+          rm -f out/*.dmg out/*.zip
+          electron-builder --publish always --prepackaged out/mac-arm64/Lusk.app
+
+      # Electron 44+ needs macOS 13, but electron-builder writes no OS minimum into the update feed,
+      # so installs on macOS 12 would download an update that cannot open. electron-updater compares
+      # this field with os.release() — the Darwin version, and macOS 13 is Darwin 22.
+      - name: Offer the update to macOS 13+ only
+        if: github.event.inputs.publish == 'true'
+        run: |
+          VERSION="v${{ steps.version.outputs.version }}"
+          mkdir -p feed
+          gh release download "$VERSION" -R "$GITHUB_REPOSITORY" --pattern latest-mac.yml --dir feed --clobber
+          grep -q '^minimumSystemVersion:' feed/latest-mac.yml || echo "minimumSystemVersion: 22.0.0" >> feed/latest-mac.yml
+          cat feed/latest-mac.yml
+          gh release upload "$VERSION" -R "$GITHUB_REPOSITORY" feed/latest-mac.yml --clobber
